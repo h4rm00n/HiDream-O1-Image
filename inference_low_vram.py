@@ -97,6 +97,8 @@ def main():
 
     def _patched_forward(**kwargs):
         kwargs["use_flash_attn"] = args.use_flash_attn
+        kwargs.pop("precomputed_image_embeds", None)
+        kwargs.pop("precomputed_deepstack_image_embeds", None)
         return _orig_forward(**kwargs)
 
     model.forward = _patched_forward

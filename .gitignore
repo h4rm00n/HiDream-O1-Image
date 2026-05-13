@@ -141,3 +141,5 @@ temp/
 
 # AirLLM directory
 airllm/
+
+infer_low2.sh
