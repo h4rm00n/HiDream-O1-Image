@@ -43,6 +43,11 @@ def main():
                    help="Disable flash attention (use 4D mask)")
     p.add_argument("--layer_shards_path", type=str, default=None,
                    help="Path to save/load splitted layer files (default: inside model_path)")
+    p.add_argument("--prefetch_layers", action="store_true", default=False,
+                   help="Preload next decoder layer on CPU while GPU computes current layer "
+                        "(overlaps I/O with compute, reduces idle time)")
+    p.add_argument("--device", type=str, default="cuda:0",
+                   help="Device for inference (e.g. cuda:0, cpu)")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"],
                    help="Model dtype")
     p.add_argument(
@@ -54,20 +59,26 @@ def main():
     )
     args = p.parse_args()
 
-    assert torch.cuda.is_available(), "CUDA is required for inference."
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = dtype_map[args.dtype]
 
+    if device.type == "cpu":
+        print("[WARNING] Running on CPU — inference will be extremely slow.")
+
     print(f"[inference] Loading processor from {args.model_path}")
     processor = AutoProcessor.from_pretrained(args.model_path)
 
-    print(f"[inference] Loading model with AirLLM-style layer-by-layer loading (dtype={dtype})...")
+    print(f"[inference] Loading model with AirLLM-style layer-by-layer loading (device={device}, dtype={dtype})...")
     model = LowVRAMImageGenerationModel(
         model_path=args.model_path,
-        device="cuda:0",
+        device=str(device),
         dtype=dtype,
         layer_shards_path=args.layer_shards_path,
+        prefetch_layers=args.prefetch_layers,
     )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_image)), exist_ok=True)

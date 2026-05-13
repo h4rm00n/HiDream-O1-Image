@@ -8,4 +8,4 @@ python inference_low_vram.py \
     --model_type dev \
     --no_flash_attn \
     --width 2048 \
-    --height 2048 
+    --height 2048

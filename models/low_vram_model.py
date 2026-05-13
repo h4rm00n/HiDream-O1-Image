@@ -2,6 +2,8 @@ import gc
 import ctypes
 import json
 import os
+import threading
+import tqdm
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +40,8 @@ def _clean_memory():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 class LowVRAMImageGenerationModel:
@@ -48,10 +51,12 @@ class LowVRAMImageGenerationModel:
         device: str = "cuda:0",
         dtype: torch.dtype = torch.bfloat16,
         layer_shards_path: Optional[str] = None,
+        prefetch_layers: bool = False,
     ):
         self.model_path = Path(model_path)
         self.device = torch.device(device)
         self.dtype = dtype
+        self.use_prefetch = prefetch_layers
 
         # Load config
         self.config = Qwen3VLConfig.from_pretrained(str(self.model_path), trust_remote_code=True)
@@ -84,6 +89,16 @@ class LowVRAMImageGenerationModel:
 
         # Track whether vision is currently loaded
         self._vision_loaded = False
+
+        # Step info for progress display: (step_idx, num_steps)
+        self._step_info = None
+
+    def _layer_iter(self, n_layers):
+        desc = "Layers"
+        if self._step_info is not None:
+            si, ns = self._step_info
+            desc = f"Step {si + 1}/{ns}"
+        return tqdm.trange(n_layers, desc=desc, leave=False)
 
     def _init_empty_model(self):
         with init_empty_weights():
@@ -258,13 +273,23 @@ class LowVRAMImageGenerationModel:
         text_model = inner_model.language_model
 
         if use_flash_attn and _flash_attn_func is not None:
-            hidden_states = self._run_decoder_flash_layer_by_layer(
-                inputs_embeds, position_ids, token_types, text_model,
-            )
+            if self.use_prefetch:
+                hidden_states = self._run_decoder_prefetch_flash_layer_by_layer(
+                    inputs_embeds, position_ids, token_types, text_model,
+                )
+            else:
+                hidden_states = self._run_decoder_flash_layer_by_layer(
+                    inputs_embeds, position_ids, token_types, text_model,
+                )
         else:
-            hidden_states = self._run_decoder_standard_layer_by_layer(
-                inputs_embeds, position_ids, token_types, text_model,
-            )
+            if self.use_prefetch:
+                hidden_states = self._run_decoder_prefetch_standard_layer_by_layer(
+                    inputs_embeds, position_ids, token_types, text_model,
+                )
+            else:
+                hidden_states = self._run_decoder_standard_layer_by_layer(
+                    inputs_embeds, position_ids, token_types, text_model,
+                )
 
         # 7. Norm
         hidden_states = text_model.norm(hidden_states)
@@ -295,9 +320,9 @@ class LowVRAMImageGenerationModel:
         idx_ar = torch.nonzero(~is_gen, as_tuple=False).squeeze(-1)
 
         hidden_states = inputs_embeds
-        head_dim = text_model.layers[0].self_attn.head_dim  # meta tensor, shape works
+        head_dim = text_model.layers[0].self_attn.head_dim
 
-        for layer_idx in range(self.num_decoder_layers):
+        for layer_idx in self._layer_iter(self.num_decoder_layers):
             sd = self._load_decoder_layer(layer_idx)
             decoder_layer = text_model.layers[layer_idx]
 
@@ -400,7 +425,7 @@ class LowVRAMImageGenerationModel:
 
         hidden_states = inputs_embeds
 
-        for layer_idx in range(self.num_decoder_layers):
+        for layer_idx in self._layer_iter(self.num_decoder_layers):
             sd = self._load_decoder_layer(layer_idx)
             decoder_layer = text_model.layers[layer_idx]
 
@@ -414,6 +439,131 @@ class LowVRAMImageGenerationModel:
             )
 
             self._unload_decoder_layer(sd)
+
+        return hidden_states
+
+    def _run_decoder_prefetch_flash_layer_by_layer(
+        self, inputs_embeds, position_ids, token_types, text_model,
+    ):
+        device = self.device
+        dtype = self.dtype
+
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        elif position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            position_ids = position_ids[1:]
+        position_embeddings = text_model.rotary_emb(inputs_embeds, position_ids)
+        cos, sin = position_embeddings
+
+        is_gen = token_types[0].bool()
+        idx_ar = torch.nonzero(~is_gen, as_tuple=False).squeeze(-1)
+
+        hidden_states = inputs_embeds
+        head_dim = text_model.layers[0].self_attn.head_dim
+
+        n_layers = self.num_decoder_layers
+        sd_curr = self._load_decoder_layer(0)
+
+        for layer_idx in self._layer_iter(n_layers - 1):
+            next_file = self._decoder_layer_files[layer_idx + 1]
+            next_sd_holder = {}
+
+            def _preload_sd():
+                next_sd_holder['sd'] = self._load_safetensors(next_file)
+
+            t = threading.Thread(target=_preload_sd, daemon=False)
+            t.start()
+
+            decoder_layer = text_model.layers[layer_idx]
+            hidden_states = self._flash_layer_forward(
+                hidden_states, decoder_layer, cos, sin, idx_ar, head_dim,
+            )
+
+            t.join()
+            self._unload_decoder_layer(sd_curr)
+            _clean_memory()
+
+            next_sd = next_sd_holder['sd']
+            self._move_params_to_device(next_sd)
+            sd_curr = next_sd
+
+        decoder_layer = text_model.layers[n_layers - 1]
+        hidden_states = self._flash_layer_forward(
+            hidden_states, decoder_layer, cos, sin, idx_ar, head_dim,
+        )
+        self._unload_decoder_layer(sd_curr)
+
+        return hidden_states
+
+    def _run_decoder_prefetch_standard_layer_by_layer(
+        self, inputs_embeds, position_ids, token_types, text_model,
+    ):
+        device = self.device
+        dtype = self.dtype
+        batch_size, total_seq_len, hidden_size = inputs_embeds.shape
+
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids_3d = position_ids[1:]
+        else:
+            text_position_ids = position_ids[0]
+            position_ids_3d = position_ids
+
+        position_embeddings = text_model.rotary_emb(inputs_embeds, position_ids_3d)
+
+        min_val = torch.finfo(dtype).min
+        attn_masks = []
+        for b in range(batch_size):
+            causal = torch.full((total_seq_len, total_seq_len), min_val, device=device, dtype=dtype)
+            causal = torch.triu(causal, diagonal=1)
+            gen_positions = token_types[b].bool()
+            causal[gen_positions, :] = 0
+            attn_masks.append(causal)
+        attention_mask_4d = torch.stack(attn_masks, dim=0).unsqueeze(1)
+
+        hidden_states = inputs_embeds
+
+        n_layers = self.num_decoder_layers
+        sd_curr = self._load_decoder_layer(0)
+
+        for layer_idx in self._layer_iter(n_layers - 1):
+            next_file = self._decoder_layer_files[layer_idx + 1]
+            next_sd_holder = {}
+
+            def _preload_sd():
+                next_sd_holder['sd'] = self._load_safetensors(next_file)
+
+            t = threading.Thread(target=_preload_sd, daemon=False)
+            t.start()
+
+            decoder_layer = text_model.layers[layer_idx]
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask_4d,
+                position_ids=text_position_ids,
+                position_embeddings=position_embeddings,
+                past_key_values=None,
+                use_cache=False,
+            )
+
+            t.join()
+            self._unload_decoder_layer(sd_curr)
+            _clean_memory()
+
+            next_sd = next_sd_holder['sd']
+            self._move_params_to_device(next_sd)
+            sd_curr = next_sd
+
+        decoder_layer = text_model.layers[n_layers - 1]
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask_4d,
+            position_ids=text_position_ids,
+            position_embeddings=position_embeddings,
+            past_key_values=None,
+            use_cache=False,
+        )
+        self._unload_decoder_layer(sd_curr)
 
         return hidden_states
 

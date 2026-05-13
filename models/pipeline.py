@@ -370,6 +370,8 @@ def generate_image(
     cond_deepstack_image_embeds = None
 
     for step_idx, step_t in enumerate(tqdm.tqdm(sched.timesteps, desc="Generating")):
+        if hasattr(model, '_step_info'):
+            model._step_info = (step_idx, len(sched.timesteps))
         t_pixeldit = 1.0 - step_t.float() / 1000.0
         sigma = (step_t.float() / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
