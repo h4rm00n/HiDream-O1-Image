@@ -71,6 +71,13 @@ def main():
         args.model_path, torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
 
+    # Override use_flash_attn to False (flash-attn not installed)
+    _orig_model_forward = model.model.forward
+    def _patched_model_forward(**kw):
+        kw["use_flash_attn"] = False
+        return _orig_model_forward(**kw)
+    model.model.forward = _patched_model_forward
+
     os.makedirs(os.path.dirname(os.path.abspath(args.output_image)), exist_ok=True)
     tokenizer = get_tokenizer(processor)
     add_special_tokens(tokenizer)

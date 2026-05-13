@@ -138,3 +138,6 @@ temp/
 *.bak
 *.tex
 *.txt
+
+# AirLLM directory
+airllm/
